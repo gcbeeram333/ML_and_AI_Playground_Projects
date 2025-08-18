@@ -1,0 +1,382 @@
+2) High-level flow (state machine)
+
+START
+└─> redact_pii ─> classify_intent ──┬─> prequal_calc
+├─> checklist
+├─> policy_rag
+├─> status_lookup
+├─> rate_faq
+├─> escalate_handoff
+└─> fallback
+└─> END
+
+3) Drop-in code (builds on your existing imports)
+from typing import Annotated, Literal, Optional, TypedDict, Dict, Any, List
+from typing_extensions import NotRequired
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver # optional
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableLambda
+
+# ----------------------------
+# Domain helpers (stubs)
+# ----------------------------
+def calc_dti(monthly_income: float, monthly_debt: float) -> float:
+if monthly_income <= 0: return 1.0
+return round(min(1.0, monthly_debt / monthly_income), 4)
+
+def calc_ltv(loan_amount: float, property_value: float) -> float:
+if property_value <= 0: return 1.0
+return round(min(1.0, loan_amount / property_value), 4)
+
+def est_monthly_pmt(loan_amount: float, annual_rate_pct: float, term_years: int) -> float:
+# Simple PI; add escrows (tax/ins/PMI) in prod
+r = (annual_rate_pct / 100) / 12
+n = term_years * 12
+if r == 0: return round(loan_amount / n, 2)
+return round(loan_amount * (r * (1 + r) ** n) / ((1 + r) ** n - 1), 2)
+
+def determine_program(flags: Dict[str, Any]) -> str:
+# naive heuristic; replace with UW rules
+if flags.get("veteran"): return "VA"
+if flags.get("down_payment_pct", 0) < 3.5: return "Conventional"
+if flags.get("fico", 740) < 620: return "FHA"
+return "Conventional"
+
+def generate_checklist(program: str, profile: Dict[str, Any]) -> List[str]:
+base = [
+"Government ID", "2 months bank statements", "Most recent mortgage statement (if applicable)",
+"Purchase agreement (if ratified)", "Homeowners insurance quote (prior to close)"
+]
+if program in ("Conventional","Jumbo"):
+base += ["W-2s (2 years) or 1099s (2 years)", "Pay stubs (last 30 days)", "Tax returns (2 years if self-employed)"]
+if program == "FHA":
+base += ["FHA Amendatory Clause", "FHA Real Estate Certification"]
+if program == "VA":
+base += ["Certificate of Eligibility (COE)", "DD-214 (if applicable)"]
+if profile.get("self_employed"): base += ["Year-to-date P&L", "Business bank statements (12 months)"]
+if profile.get("rental_income"): base += ["Lease agreements", "Schedule E (2 years)"]
+return sorted(set(base))
+
+# ----------------------------
+# External systems (stubs)
+# ----------------------------
+class LOSClient:
+def __init__(self, base_url: str, token: str):
+self.base_url = base_url; self.token = token
+def get_status(self, app_id: str) -> Dict[str, Any]:
+# TODO: wire to real LOS
+return {"application_id": app_id, "status": "Processing - Docs Review", "conditions_open": 3}
+
+def create_task(self, app_id: str, task: str, assignee: Optional[str] = None) -> str:
+return "TASK-12345"
+
+los = LOSClient(base_url="https://los.example.com", token="***")
+
+# ----------------------------
+# State
+# ----------------------------
+Intent = Literal["prequal_calc","checklist","policy_rag","status_lookup","rate_faq","escalate_handoff","fallback"]
+
+class BotState(TypedDict):
+messages: Annotated[list, add_messages]
+intent: NotRequired[Intent]
+applicant: NotRequired[Dict[str, Any]] # e.g., {"income":..., "debts":..., "fico":..., "veteran":...}
+loan_app: NotRequired[Dict[str, Any]] # e.g., {"loan_amount":..., "property_value":..., "term_years":...}
+derived: NotRequired[Dict[str, Any]] # computed metrics
+checklist: NotRequired[List[str]]
+citations: NotRequired[List[str]] # for RAG answers
+los: NotRequired[Dict[str, Any]] # status payloads
+pii_redacted: NotRequired[bool]
+escalation_ticket: NotRequired[str]
+
+# ----------------------------
+# System prompts
+# ----------------------------
+SYSTEM_POLICY = """You are a licensed-mortgage-helper style assistant.
+- Be precise, non-committal on binding credit decisions; always include 'not a credit decision' disclaimer.
+- Provide US mortgage concepts plainly; avoid legal or tax advice.
+- If unsure, ask for missing inputs succinctly.
+- Never request full SSN in chat; use masked entry flows.
+"""
+
+SYSTEM_RAG = """Answer ONLY from the retrieved policy/context. If not found, say you don’t have that policy.
+Always include short citation IDs provided by the retriever.
+"""
+
+# ----------------------------
+# Nodes
+# ----------------------------
+def redact_pii_node(state: BotState) -> Dict[str, Any]:
+# Add a lightweight scrub for logs; do NOT mutate user’s original payload upstream if you need raw values elsewhere.
+# Replace obvious patterns (very basic demo).
+new_msgs = []
+import re
+for m in state["messages"]:
+if isinstance(m, tuple) and len(m) == 2 and m[0] == "user":
+text = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "***-**-****", m[1]) # SSN pattern
+text = re.sub(r"\b\d{16}\b", "**** **** **** ****", text) # CC pattern (oversimplified)
+new_msgs.append(("user", text))
+else:
+new_msgs.append(m)
+return {"messages": new_msgs, "pii_redacted": True}
+
+def classify_intent_node(state: BotState) -> Dict[str, Any]:
+prompt = [
+SystemMessage(content="Classify the user's intent for a mortgage assistant. Choose one of: prequal_calc, checklist, policy_rag, status_lookup, rate_faq, escalate_handoff, fallback. Respond with ONLY the label."),
+HumanMessage(content=str(state["messages"][-1][1] if isinstance(state["messages"][-1], tuple) else state["messages"][-1].content))
+]
+intent_msg = llm.invoke(prompt)
+label = intent_msg.content.strip().lower()
+if label not in {"prequal_calc","checklist","policy_rag","status_lookup","rate_faq","escalate_handoff","fallback"}:
+label = "fallback"
+return {"intent": label}
+
+def prequal_calc_node(state: BotState) -> Dict[str, Any]:
+# Try to extract simple numbers from last user message if state is empty (demo); in prod parse forms/slots.
+applicant = state.get("applicant", {})
+loan_app = state.get("loan_app", {})
+last = state["messages"][-1][1] if isinstance(state["messages"][-1], tuple) else state["messages"][-1].content
+
+import re
+def pickfloat(pat):
+m = re.search(pat, last, re.I)
+return float(m.group(1)) if m else None
+
+income = applicant.get("monthly_income") or pickfloat(r"income[^0-9]*([\d,\.]+)")
+debts = applicant.get("monthly_debt") or pickfloat(r"debt[^0-9]*([\d,\.]+)")
+la = loan_app.get("loan_amount") or pickfloat(r"loan[^0-9]*([\d,\.]+)")
+pv = loan_app.get("property_value") or pickfloat(r"(home|property|value)[^0-9]*([\d,\.]+)")
+rate = loan_app.get("annual_rate_pct") or pickfloat(r"(rate|apr)[^0-9]*([\d\.]+)")
+term = loan_app.get("term_years") or 30
+
+# Normalize comma numbers
+def norm(x):
+if x is None: return None
+return float(str(x).replace(",",""))
+income, debts, la, pv, rate = map(norm, (income, debts, la, pv, rate))
+
+# Basic metrics
+dti = calc_dti(income or 0, debts or 0) if (income is not None and debts is not None) else None
+ltv = calc_ltv(la or 0, pv or 0) if (la is not None and pv is not None) else None
+pmt = est_monthly_pmt(la or 0, rate or 6.5, int(term))
+
+# Respond
+text = "Here’s a quick, non-binding pre-qual view (for education; not a credit decision):\n"
+if dti is not None: text += f"- **DTI**: {round(dti*100,2)}%\n"
+if ltv is not None: text += f"- **LTV**: {round(ltv*100,2)}%\n"
+text += f"- **Est. PI payment** (no taxes/ins/PMI): ${pmt:,.0f}\n"
+text += "\nRules of thumb:\n- DTI ≤ 43% is common; strong files often ≤ 36%.\n- LTV ≤ 80% avoids PMI on Conventional.\n"
+text += "\nIf you share: monthly income, monthly debts, target price/down payment, we’ll refine these instantly."
+
+return {
+"messages": [AIMessage(content=text)],
+"derived": {"dti": dti, "ltv": ltv, "est_payment": pmt}
+}
+
+# (Stub) Plug your own retriever here (FAISS, PGVector, Azure AI Search, etc.)
+def policy_rag_node(state: BotState) -> Dict[str, Any]:
+user_q = state["messages"][-1][1] if isinstance(state["messages"][-1], tuple) else state["messages"][-1].content
+# Example: call your retriever → returns context + citation IDs
+retrieved = [
+{"chunk": "Conventional: Max DTI typically 45%; may allow up to 50% with strong compensating factors.", "cite": "Conv-Guide §DTI-3.2"},
+{"chunk": "FHA: Minimum down payment 3.5% for ≥580 FICO; MIP applies.", "cite": "FHA-4000.1 §II.A"}
+]
+context = "\n".join([f"[{r['cite']}] {r['chunk']}" for r in retrieved])
+prompt = [
+SystemMessage(content=SYSTEM_RAG),
+HumanMessage(content=f"Question: {user_q}\n\nContext:\n{context}\n\nAnswer with citations in brackets.")
+]
+answer = llm.invoke(prompt).content
+cites = [r["cite"] for r in retrieved if r["cite"] in answer]
+return {"messages":[AIMessage(content=answer)], "citations": cites}
+
+def checklist_node(state: BotState) -> Dict[str, Any]:
+profile = state.get("applicant", {})
+flags = {
+"veteran": profile.get("veteran", False),
+"fico": profile.get("fico", 700),
+"down_payment_pct": profile.get("down_payment_pct", 10),
+}
+program = determine_program(flags)
+ck = generate_checklist(program, {"self_employed": profile.get("self_employed", False),
+"rental_income": profile.get("rental_income", False)})
+msg = f"Based on a likely **{program}** track, here’s your *initial* checklist (we’ll prune after AUS findings):\n- " + "\n- ".join(ck) + \
+"\n\nTip: Snap/upload from your phone; we’ll auto-OCR and verify. If you enable bank-link, we can satisfy some items automatically."
+return {"messages":[AIMessage(content=msg)], "checklist": ck}
+
+def status_lookup_node(state: BotState) -> Dict[str, Any]:
+# Pull an appId from text (demo) or from user’s profile/session
+import re
+last = state["messages"][-1][1] if isinstance(state["messages"][-1], tuple) else state["messages"][-1].content
+m = re.search(r"(APP-\d+)", last)
+app_id = m.group(1) if m else "APP-00001"
+payload = los.get_status(app_id)
+text = f"**Application {payload['application_id']}**: {payload['status']}. Open conditions: {payload['conditions_open']}.\n" \
+"I can request missing docs now or schedule a call with processing—what do you prefer?"
+return {"messages":[AIMessage(content=text)], "los": payload}
+
+def rate_faq_node(state: BotState) -> Dict[str, Any]:
+text = ("Rates move daily and depend on credit score, LTV, points, lock period, and product (30y fixed, 7/6 ARM, etc.). "
+"For an estimate, share credit band (e.g., 740+), LTV, loan amount, and lock days. "
+"Note: This is educational info, **not a rate lock or credit decision**.")
+return {"messages":[AIMessage(content=text)]}
+
+def escalate_node(state: BotState) -> Dict[str, Any]:
+# Create a processing task (stub)
+app_id = "APP-00001"
+tid = los.create_task(app_id, task="Borrower needs human assistance / exception review")
+return {"messages":[AIMessage(content=f"I’ve flagged your file for a human review (ticket {tid}). We’ll keep working in parallel.")],
+"escalation_ticket": tid}
+
+def fallback_node(state: BotState) -> Dict[str, Any]:
+return {"messages":[AIMessage(content="I didn’t quite catch that. I can help with pre-qual math, document checklists, policy rules, application status, and rate FAQs. What would you like to do?")]}
+
+Build the graph with conditional routing
+graph_builder = StateGraph(BotState)
+
+graph_builder.add_node("redact_pii", redact_pii_node)
+graph_builder.add_node("classify_intent", classify_intent_node)
+
+graph_builder.add_node("prequal_calc", prequal_calc_node)
+graph_builder.add_node("checklist", checklist_node)
+graph_builder.add_node("policy_rag", policy_rag_node)
+graph_builder.add_node("status_lookup", status_lookup_node)
+graph_builder.add_node("rate_faq", rate_faq_node)
+graph_builder.add_node("escalate_handoff", escalate_node)
+graph_builder.add_node("fallback", fallback_node)
+
+graph_builder.add_edge(START, "redact_pii")
+graph_builder.add_edge("redact_pii", "classify_intent")
+
+def route_by_intent(state: BotState) -> str:
+return state.get("intent","fallback")
+
+graph_builder.add_conditional_edges("classify_intent", route_by_intent, {
+"prequal_calc": "prequal_calc",
+"checklist": "checklist",
+"policy_rag": "policy_rag",
+"status_lookup": "status_lookup",
+"rate_faq": "rate_faq",
+"escalate_handoff": "escalate_handoff",
+"fallback": "fallback"
+})
+
+graph_builder.add_edge("prequal_calc", END)
+graph_builder.add_edge("checklist", END)
+graph_builder.add_edge("policy_rag", END)
+graph_builder.add_edge("status_lookup", END)
+graph_builder.add_edge("rate_faq", END)
+graph_builder.add_edge("escalate_handoff", END)
+graph_builder.add_edge("fallback", END)
+
+# Optional: memory checkpointer
+memory = MemorySaver()
+graph = graph_builder.compile(checkpointer=memory)
+
+Minimal chat loop
+
+while True:
+user_input = input("User: ")
+if user_input.lower() in ["quit","q"]:
+print("Good Bye")
+break
+events = graph.stream({'messages': ("user", user_input)})
+for ev in events:
+for v in ev.values():
+msg = v.get("messages")
+if msg:
+out = msg[-1].content if isinstance(msg, list) else msg.content
+print("Assistant:", out)
+
+
+4) What actually reduces cycle time
+Up-front automation
+
+
+
+Dynamic checklist: instantly tailored + links to e-consent, bank-link (VOA), payroll-link (VOI/VOE).
+
+Smart missing-items pings: if AUS/processor opens a condition, bot requests exactly that item with context and upload link.
+
+
+
+Verification shortcuts
+
+
+
+Bank & payroll APIs (Plaid/Finicity/Truework/Talon): bot initiates link flow.
+
+OCR + field extraction for W-2/1099/paystubs/bank statements; auto-compare deltas against 1003 and flag anomalies.
+
+
+
+Clarify blockers early
+
+
+
+DTI/LTV calc in chat + alternative scenarios (more down payment, buy points, pay off small debt) to hit AUS pass quickly.
+
+
+
+Self-serve status
+
+
+
+Borrowers get current LOS status + which conditions remain, 24/7. Fewer emails/calls; processor time saved.
+
+
+
+Guardrails
+
+
+
+Policy RAG so answers cite your lender overlays, avoiding back-and-forth corrections.
+
+Compliance logging with masked PII; transcripts ready for QC.
+
+5) Plug in your RAG retriever (when ready)
+
+
+Replace policy_rag_node with your vector store:
+
+# Example (FAISS) outline:
+from langchain_community.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+
+emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vs = FAISS.load_local("mortgage_policy_index", emb)
+
+def policy_rag_node(state: BotState):
+q = state["messages"][-1][1] if isinstance(state["messages"][-1], tuple) else state["messages"][-1].content
+docs = vs.similarity_search(q, k=4)
+context = "\n".join([f"[doc{idx}] {d.page_content}" for idx, d in enumerate(docs, start=1)])
+cites = [f"doc{idx}" for idx, _ in enumerate(docs, start=1)]
+prompt = [
+SystemMessage(content=SYSTEM_RAG),
+HumanMessage(content=f"Q: {q}\n\nContext:\n{context}\n\nAnswer with citations like [doc1].")
+]
+ans = llm.invoke(prompt).content
+return {"messages":[AIMessage(content=ans)], "citations": [c for c in cites if c in ans]}
+
+
+6) Production notes & guardrails
+Disclaimers: Always include “educational, not a credit decision / not a rate lock.”
+
+PII: Keep the raw values in secure app state, but mask in logs (redact_pii_node).
+
+Human-in-the-loop: escalate_handoff should page the right queue (processing/underwriting) with transcript + summary.
+
+Metrics (LangSmith): track First-contact resolution, Doc turnaround time, Time-to-AUS-Approve, Processor touches per file, Borrower satisfaction.
+
+7) Quick examples to try
+“My income is 8,500/mo, debts 1,200/mo. Home price 500k, 10% down, 30y, rate ~6.75%. Am I in range?”
+
+“What’s max DTI for Conventional vs FHA? Cite the policy.”
+
+“What docs do I need if I’m self-employed and using rental income?”
+
+“What’s the status of APP-12345? What’s still outstanding?”
+
+“Can I buy discount points to reduce payment under 3k/mo?”
