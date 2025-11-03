@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+Complex Document Extraction Bot
+- Submits complex docs to ADE (LandingAI Document Extractor)
+- Robust polling with retries & progress logs
+- Normalizes output (Markdown + JSON)
+- Chunks for RAG and (optional) upserts to Azure AI Search
+
+Usage:
+  python doc_extraction_bot.py --path ./inbox/*.pdf --model dpt-2-latest --to-search
+  python doc_extraction_bot.py --path ./one.pdf
+
+Env vars required:
+  VISION_AGENT_API_KEY=<ADE API key>
+Optional for Azure AI Search upserts (enabled with --to-search):
+  AZURE_SEARCH_ENDPOINT=https://<your-search>.search.windows.net
+  AZURE_SEARCH_KEY=<admin or query key with write>
+  AZURE_SEARCH_INDEX=<index name>
+"""
+
+import os
+import re
+import json
+import time
+import glob
+import uuid
+import argparse
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+# --- ADE client (from your snippet) ---
+try:
+    from landingai_ade import LandingAIADE
+except Exception:
+    LandingAIADE = None  # keep import optional for readers
+
+# --- Lightweight retry helper ---
+def retry(times=5, delay=2, backoff=2.0, exceptions=(Exception,)):
+    def wrapper(fn):
+        def inner(*args, **kwargs):
+            d = delay
+            for attempt in range(1, times + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == times:
+                        raise
+                    print(f"[retry] {fn.__name__} failed (attempt {attempt}/{times}): {e}; sleeping {d}s")
+                    time.sleep(d); d *= backoff
+        return inner
+    return wrapper
+
+# --- Utilities ---
+def read_env(name: str, required: bool = True) -> Optional[str]:
+    val = os.environ.get(name)
+    if required and not val:
+        raise RuntimeError(f"Missing environment variable: {name}")
+    return val
+
+def clean_text(s: str) -> str:
+    # normalize whitespace and remove null bytes
+    return re.sub(r'\s+\n', '\n', s.replace('\x00', '')).strip()
+
+def chunk_markdown(md: str, max_chars: int = 2000) -> List[str]:
+    """Simple semantic-ish chunking: split on headings/paragraph gaps then pack."""
+    parts = re.split(r'(?m)^(?=#+\s)|\n{2,}', md)
+    chunks, cur = [], ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(cur) + len(p) + 2 > max_chars:
+            if cur:
+                chunks.append(cur.strip())
+            cur = p
+        else:
+            cur = (cur + "\n\n" + p).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+def mk_doc_id(source_path: Path) -> str:
+    return f"{source_path.stem}-{uuid.uuid4().hex[:8]}"
+
+# --- Azure AI Search upsert (REST) ---
+def upsert_to_azure_search(chunks: List[str], metadata: Dict[str, Any]) -> None:
+    endpoint = read_env("AZURE_SEARCH_ENDPOINT", required=True).rstrip("/")
+    key = read_env("AZURE_SEARCH_KEY", required=True)
+    index = read_env("AZURE_SEARCH_INDEX", required=True)
+
+    url = f"{endpoint}/indexes/{index}/docs/index?api-version=2024-07-01"
+    payload = {"value": []}
+    base = {
+        "source_path": str(metadata.get("source_path")),
+        "job_id": metadata.get("job_id"),
+        "model": metadata.get("model"),
+        "title": metadata.get("title"),
+        "mime_type": metadata.get("mime_type", "application/pdf"),
+        "created_at": metadata.get("created_at"),
+    }
+    for i, text in enumerate(chunks):
+        payload["value"].append({
+            "@search.action": "mergeOrUpload",
+            "id": f"{metadata['doc_id']}#{i}",
+            "content": text,
+            **base
+        })
+
+    import requests
+    headers = {"Content-Type": "application/json", "api-key": key}
+    r = requests.post(url, headers=headers, data=json.dumps(payload))
+    if r.status_code >= 300:
+        raise RuntimeError(f"Azure Search upsert failed: {r.status_code} {r.text}")
+    print(f"[search] Upserted {len(chunks)} chunk(s) to index '{index}'.")
+
+# --- ADE interactions ---
+def get_ade_client() -> Any:
+    if LandingAIADE is None:
+        raise RuntimeError("landingai_ade package not installed. `pip install landingai-ade`")
+    api_key = read_env("VISION_AGENT_API_KEY", required=True)
+    return LandingAIADE(apikey=api_key)
+
+@retry(times=3, delay=2)
+def ade_submit(client: Any, path: Path, model: str) -> Dict[str, Any]:
+    print(f"[ade] Submitting: {path.name} (model={model})")
+    job = client.parse_jobs.create(document=path, model=model)
+    return {"job_id": job.job_id}
+
+@retry(times=8, delay=3)
+def ade_poll_until_done(client: Any, job_id: str, poll_every: int = 8) -> Dict[str, Any]:
+    while True:
+        status = client.parse_jobs.get(job_id)
+        st = getattr(status, "status", None)
+        progress = getattr(status, "progress", None)
+        print(f"[ade] {job_id} status={st} progress={progress if progress is not None else 0}%")
+        if st == "completed":
+            return status.__dict__ if hasattr(status, "__dict__") else status
+        elif st in {"failed", "canceled"}:
+            raise RuntimeError(f"ADE job ended with status={st}")
+        time.sleep(poll_every)
+
+def extract_payload(status_obj: Dict[str, Any]) -> Dict[str, Any]:
+    # Prefer explicit output_url; else inline data.markdown
+    output_url = status_obj.get("output_url")
+    data = status_obj.get("data") or {}
+    markdown = (data.get("markdown") or "").strip()
+
+    if output_url:
+        print(f"[ade] Output available for download: {output_url}")
+        # Optional: actually download artifact; for brevity we rely on inline markdown if present
+    if not markdown and data:
+        # Fallback: try 'text' or generic content keys
+        markdown = (data.get("text") or data.get("content") or "").strip()
+
+    if not markdown:
+        markdown = "# Document\n\n(Empty or non-textual output returned.)"
+
+    return {"markdown": clean_text(markdown), "raw": data}
+
+# --- Main pipeline per file ---
+def process_file(path: Path, model: str, to_search: bool) -> None:
+    client = get_ade_client()
+    job_info = ade_submit(client, path, model)
+    status = ade_poll_until_done(client, job_info["job_id"])
+    payload = extract_payload(status)
+
+    # Persist normalized outputs
+    out_dir = Path("./out"); out_dir.mkdir(exist_ok=True, parents=True)
+    doc_id = mk_doc_id(path)
+    md_path = out_dir / f"{doc_id}.md"
+    json_path = out_dir / f"{doc_id}.json"
+
+    md_path.write_text(payload["markdown"], encoding="utf-8")
+    json_path.write_text(json.dumps({"raw": payload["raw"]}, indent=2), encoding="utf-8")
+    print(f"[out] Saved:\n  - {md_path}\n  - {json_path}")
+
+    # Chunking & (optional) upsert to Azure Search
+    chunks = chunk_markdown(payload["markdown"], max_chars=1800)
+    print(f"[rag] Created {len(chunks)} chunk(s).")
+
+    if to_search:
+        meta = {
+            "doc_id": doc_id,
+            "title": path.stem,
+            "source_path": str(path.resolve()),
+            "job_id": job_info["job_id"],
+            "model": model,
+            "mime_type": "application/pdf" if path.suffix.lower() == ".pdf" else "image/*",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        upsert_to_azure_search(chunks, meta)
+
+def main():
+    ap = argparse.ArgumentParser(description="Complex Document Extraction Bot")
+    ap.add_argument("--path", required=True, help="File path or glob (e.g., ./inbox/*.pdf)")
+    ap.add_argument("--model", default="dpt-2-latest", help="ADE model name")
+    ap.add_argument("--to-search", action="store_true", help="Upsert chunks to Azure AI Search")
+    args = ap.parse_args()
+
+    files = [Path(p) for p in glob.glob(args.path)]
+    if not files:
+        raise SystemExit(f"No files found for pattern: {args.path}")
+
+    for f in files:
+        try:
+            process_file(f, model=args.model, to_search=args.to_search)
+        except Exception as e:
+            print(f"[error] {f.name}: {e}")
+
+if __name__ == "__main__":
+    main()
